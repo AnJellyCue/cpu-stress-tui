@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
+import os
 import random
+import signal
 import subprocess
 import time
 
@@ -69,6 +71,7 @@ class CPUStressTUI(App):
         super().__init__()
 
         self.cores = psutil.cpu_count(logical=True)
+
         self.loads = [
             1,
             2,
@@ -79,8 +82,10 @@ class CPUStressTUI(App):
             self.cores,
         ]
 
-        # Remove duplicate values on small CPUs.
-        self.loads = sorted(set(min(x, self.cores) for x in self.loads))
+        # Remove duplicates and make sure we never exceed available CPUs.
+        self.loads = sorted(
+            set(min(x, self.cores) for x in self.loads)
+        )
 
         self.cpu_workers = 0
         self.started = 0
@@ -99,16 +104,19 @@ class CPUStressTUI(App):
                     f"CPU THREADS\n{self.cores}",
                     classes="value",
                 )
+
                 yield Static(
                     "STATUS\nStarting...",
                     id="status",
                     classes="value",
                 )
+
                 yield Static(
                     "CPU LOAD\n--",
                     id="cpu",
                     classes="value",
                 )
+
                 yield Static(
                     "TEMPERATURE\n--",
                     id="temp",
@@ -118,25 +126,47 @@ class CPUStressTUI(App):
             with Vertical(classes="panel", id="load"):
                 yield Label("CURRENT TEST")
                 yield Label("--", id="current")
-                yield ProgressBar(total=DURATION, show_eta=False, id="progress")
-                yield Label("Time remaining: --", id="remaining")
+
+                yield ProgressBar(
+                    total=DURATION,
+                    show_eta=False,
+                    id="progress",
+                )
+
+                yield Label(
+                    "Time remaining: --",
+                    id="remaining",
+                )
 
             with Vertical(classes="panel", id="history"):
                 yield Label("TEST HISTORY")
-                yield Static("No tests completed yet.", id="history_text")
+
+                yield Static(
+                    "No tests completed yet.",
+                    id="history_text",
+                )
 
         yield Footer()
 
     def on_mount(self):
-        self.cpu_timer = self.set_interval(1, self.update_display)
+        self.cpu_timer = self.set_interval(
+            1,
+            self.update_display,
+        )
+
         self.start_test()
 
     def start_test(self):
+        # Make absolutely sure an old process is gone first.
+        self.stop_stress()
+
         self.cpu_workers = random.choice(self.loads)
         self.started = time.monotonic()
         self.running = True
         self.paused = False
 
+        # Create a separate process group so we can kill stress
+        # and all of its worker processes together.
         self.process = subprocess.Popen(
             [
                 "stress",
@@ -147,17 +177,56 @@ class CPUStressTUI(App):
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            start_new_session=True,
         )
 
         self.query_one("#current", Label).update(
-            f"{self.cpu_workers} CPU workers / {self.cores} threads"
+            f"{self.cpu_workers} CPU workers / "
+            f"{self.cores} threads"
         )
 
         self.query_one("#status", Static).update(
             "STATUS\nRUNNING"
         )
 
-        self.query_one("#progress", ProgressBar).update(progress=0)
+        self.query_one("#progress", ProgressBar).update(
+            progress=0
+        )
+
+    def stop_stress(self):
+        """Safely terminate stress and all of its worker processes."""
+
+        if not self.process:
+            return
+
+        if self.process.poll() is None:
+            try:
+                # Kill the entire process group.
+                os.killpg(
+                    os.getpgid(self.process.pid),
+                    signal.SIGTERM,
+                )
+
+                self.process.wait(timeout=2)
+
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(
+                        os.getpgid(self.process.pid),
+                        signal.SIGKILL,
+                    )
+                except ProcessLookupError:
+                    pass
+
+                try:
+                    self.process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass
+
+            except ProcessLookupError:
+                pass
+
+        self.process = None
 
     def update_display(self):
         cpu = psutil.cpu_percent(interval=None)
@@ -175,13 +244,15 @@ class CPUStressTUI(App):
                     if entry.current:
                         temperature = entry.current
                         break
+
                 if temperature:
                     break
 
-            if temperature:
+            if temperature is not None:
                 self.query_one("#temp", Static).update(
                     f"TEMPERATURE\n{temperature:.0f}°C"
                 )
+
         except Exception:
             pass
 
@@ -206,13 +277,19 @@ class CPUStressTUI(App):
             self.finish_test()
 
     def finish_test(self):
+        if not self.running:
+            return
+
         self.running = False
+        self.process = None
 
         timestamp = time.strftime("%H:%M:%S")
 
         self.history.insert(
             0,
-            f"{timestamp}   {self.cpu_workers:>3} / {self.cores} threads"
+            f"{timestamp}   "
+            f"{self.cpu_workers:>3} / "
+            f"{self.cores} threads"
         )
 
         self.history = self.history[:10]
@@ -221,28 +298,34 @@ class CPUStressTUI(App):
             "\n".join(self.history)
         )
 
-        self.set_timer(0.5, self.start_test)
+        self.query_one("#status", Static).update(
+            "STATUS\nCOMPLETED"
+        )
+
+        self.set_timer(
+            0.5,
+            self.start_test,
+        )
 
     def action_pause(self):
         if not self.running:
             return
 
         if not self.paused:
-            if self.process:
-                self.process.terminate()
+            self.stop_stress()
 
             self.paused = True
 
             self.query_one("#status", Static).update(
                 "STATUS\nPAUSED"
             )
+
         else:
             self.paused = False
             self.start_test()
 
     def action_stop(self):
-        if self.process and self.process.poll() is None:
-            self.process.terminate()
+        self.stop_stress()
 
         self.running = False
         self.paused = False
@@ -255,11 +338,22 @@ class CPUStressTUI(App):
             "Test stopped"
         )
 
-    def action_reroll(self):
-        if self.process and self.process.poll() is None:
-            self.process.terminate()
+        self.query_one("#remaining", Label).update(
+            "Time remaining: --"
+        )
 
+    def action_reroll(self):
+        self.stop_stress()
         self.start_test()
+
+    def on_unmount(self):
+        """
+        Final safety net.
+
+        Called when the Textual application shuts down.
+        Ensures stress cannot remain running after the TUI exits.
+        """
+        self.stop_stress()
 
 
 if __name__ == "__main__":
